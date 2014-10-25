@@ -28,19 +28,17 @@ import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.action.ActionFuture;
 import org.elasticsearch.action.admin.indices.alias.Alias;
 import org.elasticsearch.action.index.IndexRequestBuilder;
+import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.xcontent.ToXContent;
 import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.common.xcontent.json.JsonXContent;
 import org.elasticsearch.index.mapper.core.AbstractFieldMapper;
-import org.elasticsearch.index.service.IndexService;
-import org.elasticsearch.indices.IndicesService;
+import org.hamcrest.Matcher;
 import org.junit.Test;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ExecutionException;
 
 import static org.elasticsearch.common.settings.ImmutableSettings.settingsBuilder;
@@ -407,7 +405,6 @@ public class GetTermVectorTests extends AbstractTermVectorTests {
 
     @Test
     public void testRandomPayloadWithDelimitedPayloadTokenFilter() throws ElasticsearchException, IOException {
-
         //create the test document
         int encoding = randomIntBetween(0, 2);
         String encodingString = "";
@@ -926,7 +923,206 @@ public class GetTermVectorTests extends AbstractTermVectorTests {
         }
     }
 
+    @Test
+    public void testPerFieldAnalyzer() throws ElasticsearchException, IOException {
+        int numFields = 25;
+
+        // setup mapping and document source
+        Set<String> withTermVectors = new HashSet<>();
+        XContentBuilder mapping = jsonBuilder().startObject().startObject("type1").startObject("properties");
+        XContentBuilder source = jsonBuilder().startObject();
+        for (int i = 0; i < numFields; i++) {
+            String fieldName = "field" + i;
+            if (randomBoolean()) {
+                withTermVectors.add(fieldName);
+            }
+            mapping.startObject(fieldName)
+                    .field("type", "string")
+                    .field("term_vector", withTermVectors.contains(fieldName) ? "yes" : "no")
+                    .endObject();
+            source.field(fieldName, "some text here");
+        }
+        source.endObject();
+        mapping.endObject().endObject().endObject();
+
+        // setup indices with mapping
+        ImmutableSettings.Builder settings = settingsBuilder()
+                .put(indexSettings())
+                .put("index.analysis.analyzer", "standard");
+        assertAcked(prepareCreate("test")
+                .addAlias(new Alias("alias"))
+                .setSettings(settings)
+                .addMapping("type1", mapping));
+        ensureGreen();
+
+        // index a single document with prepared source
+        client().prepareIndex("test", "type1", "0").setSource(source).get();
+        refresh();
+
+        // create random per_field_analyzer and selected fields
+        Map<String, String> perFieldAnalyzer = new HashMap<>();
+        Set<String> selectedFields = new HashSet<>();
+        for (int i = 0; i < numFields; i++) {
+            if (randomBoolean()) {
+                perFieldAnalyzer.put("field" + i, "keyword");
+            }
+            if (randomBoolean()) {
+                perFieldAnalyzer.put("non_existing" + i, "keyword");
+            }
+            if (randomBoolean()) {
+                selectedFields.add("field" + i);
+            }
+            if (randomBoolean()) {
+                selectedFields.add("non_existing" + i);
+            }
+        }
+
+        // selected fields not specified
+        TermVectorResponse response = client().prepareTermVector(indexOrAlias(), "type1", "0")
+                .setPerFieldAnalyzer(perFieldAnalyzer)
+                .get();
+
+        // should return all fields that have terms vectors, some with overridden analyzer
+        checkAnalyzedFields(response.getFields(), withTermVectors, perFieldAnalyzer);
+
+        // selected fields specified including some not in the mapping
+        response = client().prepareTermVector(indexOrAlias(), "type1", "0")
+                .setSelectedFields(selectedFields.toArray(Strings.EMPTY_ARRAY))
+                .setPerFieldAnalyzer(perFieldAnalyzer)
+                .get();
+
+        // should return only the specified valid fields, with some with overridden analyzer
+        checkAnalyzedFields(response.getFields(), selectedFields, perFieldAnalyzer);
+    }
+
+    private void checkAnalyzedFields(Fields fieldsObject, Set<String> fieldNames, Map<String, String> perFieldAnalyzer) throws IOException {
+        Set<String> validFields = new HashSet<>();
+        for (String fieldName : fieldNames){
+            if (fieldName.startsWith("non_existing")) {
+                assertThat("Non existing field\"" + fieldName + "\" should not be returned!", fieldsObject.terms(fieldName), nullValue());
+                continue;
+            }
+            Terms terms = fieldsObject.terms(fieldName);
+            assertThat("Existing field " + fieldName + "should have been returned", terms, notNullValue());
+            // check overridden by keyword analyzer ...
+            if (perFieldAnalyzer.containsKey(fieldName)) {
+                TermsEnum iterator = terms.iterator(null);
+                assertThat("Analyzer for " + fieldName + " should have been overridden!", iterator.next().utf8ToString(), equalTo("some text here"));
+                assertThat(iterator.next(), nullValue());
+            }
+            validFields.add(fieldName);
+        }
+        // ensure no other fields are returned
+        assertThat("More fields than expected are returned!", fieldsObject.size(), equalTo(validFields.size()));
+    }
+
     private static String indexOrAlias() {
         return randomBoolean() ? "test" : "alias";
     }
+
+    @Test
+    public void testDfs() throws ElasticsearchException, ExecutionException, InterruptedException, IOException {
+        logger.info("Setting up the index ...");
+        ImmutableSettings.Builder settings = settingsBuilder()
+                .put(indexSettings())
+                .put("index.analysis.analyzer", "standard")
+                .put("index.number_of_shards", randomIntBetween(2, 10)); // we need at least 2 shards
+        assertAcked(prepareCreate("test")
+                .setSettings(settings)
+                .addMapping("type1", "text", "type=string"));
+        ensureGreen();
+
+        int numDocs = scaledRandomIntBetween(25, 100);
+        logger.info("Indexing {} documents...", numDocs);
+        List<IndexRequestBuilder> builders = new ArrayList<>();
+        for (int i = 0; i < numDocs; i++) {
+            builders.add(client().prepareIndex("test", "type1", i + "").setSource("text", "cat"));
+        }
+        indexRandom(true, builders);
+
+        XContentBuilder expectedStats = jsonBuilder()
+                .startObject()
+                .startObject("text")
+                    .startObject("field_statistics")
+                    .field("sum_doc_freq", numDocs)
+                    .field("doc_count", numDocs)
+                    .field("sum_ttf", numDocs)
+                .endObject()
+                    .startObject("terms")
+                        .startObject("cat")
+                        .field("doc_freq", numDocs)
+                        .field("ttf", numDocs)
+                        .endObject()
+                    .endObject()
+                .endObject()
+                .endObject();
+
+        logger.info("Without dfs 'cat' should appear strictly less than {} times.", numDocs);
+        TermVectorResponse response = client().prepareTermVector("test", "type1", randomIntBetween(0, numDocs - 1) + "")
+                .setSelectedFields("text")
+                .setFieldStatistics(true)
+                .setTermStatistics(true)
+                .get();
+        checkStats(response.getFields(), expectedStats, false);
+
+        logger.info("With dfs 'cat' should appear exactly {} times.", numDocs);
+        response = client().prepareTermVector("test", "type1", randomIntBetween(0, numDocs - 1) + "")
+                .setSelectedFields("text")
+                .setFieldStatistics(true)
+                .setTermStatistics(true)
+                .setDfs(true)
+                .get();
+        checkStats(response.getFields(), expectedStats, true);
+    }
+
+    private void checkStats(Fields fields, XContentBuilder xContentBuilder, boolean isEqual) throws IOException {
+        Map<String, Object> stats = JsonXContent.jsonXContent.createParser(xContentBuilder.bytes()).map();
+        assertThat("number of fields expected:", fields.size(), equalTo(stats.size()));
+        for (String fieldName : fields) {
+            logger.info("Checking field statistics for field: {}", fieldName);
+            Terms terms = fields.terms(fieldName);
+            Map<String, Integer> fieldStatistics = getFieldStatistics(stats, fieldName);
+            String msg = "field: " + fieldName + " ";
+            assertThat(msg + "sum_doc_freq:",
+                    (int) terms.getSumDocFreq(),
+                    equalOrLessThanTo(fieldStatistics.get("sum_doc_freq"), isEqual));
+            assertThat(msg + "doc_count:",
+                    terms.getDocCount(),
+                    equalOrLessThanTo(fieldStatistics.get("doc_count"), isEqual));
+            assertThat(msg + "sum_ttf:",
+                    (int) terms.getSumTotalTermFreq(),
+                    equalOrLessThanTo(fieldStatistics.get("sum_ttf"), isEqual));
+
+            final TermsEnum termsEnum = terms.iterator(null);
+            BytesRef text;
+            while((text = termsEnum.next()) != null) {
+                String term = text.utf8ToString();
+                logger.info("Checking term statistics for term: ({}, {})", fieldName, term);
+                Map<String, Integer> termStatistics = getTermStatistics(stats, fieldName, term);
+                msg = "term: (" + fieldName + "," + term + ") ";
+                assertThat(msg + "doc_freq:",
+                        termsEnum.docFreq(),
+                        equalOrLessThanTo(termStatistics.get("doc_freq"), isEqual));
+                assertThat(msg + "ttf:",
+                        (int) termsEnum.totalTermFreq(),
+                        equalOrLessThanTo(termStatistics.get("ttf"), isEqual));
+            }
+        }
+    }
+
+    private Map<String, Integer> getFieldStatistics(Map<String, Object> stats, String fieldName) throws IOException {
+        return (Map<String, Integer>) ((Map<String, Object>) stats.get(fieldName)).get("field_statistics");
+    }
+
+    private Map<String, Integer> getTermStatistics(Map<String, Object> stats, String fieldName, String term) {
+        return (Map<String, Integer>) ((Map<String, Object>) ((Map<String, Object>) stats.get(fieldName)).get("terms")).get(term);
+    }
+
+    private Matcher<Integer> equalOrLessThanTo(Integer value, boolean isEqual) {
+        if (isEqual) {
+            return equalTo(value);
+        }
+        return lessThan(value);
+    }
+
 }

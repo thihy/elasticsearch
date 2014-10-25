@@ -22,6 +22,7 @@ package org.elasticsearch.search;
 import com.carrotsearch.hppc.ObjectOpenHashSet;
 import com.carrotsearch.hppc.ObjectSet;
 import com.carrotsearch.hppc.cursors.ObjectCursor;
+import com.google.common.base.Charsets;
 import com.google.common.collect.ImmutableMap;
 import org.apache.lucene.index.AtomicReaderContext;
 import org.apache.lucene.index.NumericDocValues;
@@ -77,7 +78,6 @@ import org.elasticsearch.search.warmer.IndexWarmersMetaData;
 import org.elasticsearch.threadpool.ThreadPool;
 
 import java.io.IOException;
-import java.nio.charset.Charset;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
@@ -464,7 +464,7 @@ public class SearchService extends AbstractLifecycleComponent<SearchService> {
         }
     }
 
-    public FetchSearchResult executeFetchPhase(FetchSearchRequest request) throws ElasticsearchException {
+    public FetchSearchResult executeFetchPhase(ShardFetchRequest request) throws ElasticsearchException {
         final SearchContext context = findContext(request.id());
         contextProcessing(context);
         try {
@@ -523,7 +523,7 @@ public class SearchService extends AbstractLifecycleComponent<SearchService> {
         SearchShardTarget shardTarget = new SearchShardTarget(clusterService.localNode().id(), request.index(), request.shardId());
 
         Engine.Searcher engineSearcher = searcher == null ? indexShard.acquireSearcher("search") : searcher;
-        SearchContext context = new DefaultSearchContext(idGenerator.incrementAndGet(), request, shardTarget, engineSearcher, indexService, indexShard, scriptService, pageCacheRecycler, bigArrays);
+        SearchContext context = new DefaultSearchContext(idGenerator.incrementAndGet(), request, shardTarget, engineSearcher, indexService, indexShard, scriptService, pageCacheRecycler, bigArrays, threadPool.estimatedTimeInMillisCounter());
         SearchContext.setCurrent(context);
         try {
             context.scroll(request.scroll());
@@ -614,11 +614,21 @@ public class SearchService extends AbstractLifecycleComponent<SearchService> {
 
                 if (templateContext.scriptType().equals(ScriptService.ScriptType.INLINE)) {
                     //Try to double parse for nested template id/file
-                    parser = XContentFactory.xContent(templateContext.template().getBytes(Charset.defaultCharset())).createParser(templateContext.template().getBytes(Charset.defaultCharset()));
-                    TemplateQueryParser.TemplateContext innerContext = TemplateQueryParser.parse(parser, "params");
-                    if (hasLength(innerContext.template()) && !innerContext.scriptType().equals(ScriptService.ScriptType.INLINE)) {
-                        //An inner template referring to a filename or id
-                        templateContext = new TemplateQueryParser.TemplateContext(innerContext.scriptType(), innerContext.template(), templateContext.params());
+                    parser = null;
+                    try {
+                        byte[] templateBytes = templateContext.template().getBytes(Charsets.UTF_8);
+                        parser = XContentFactory.xContent(templateBytes).createParser(templateBytes);
+                    } catch (ElasticsearchParseException epe) {
+                        //This was an non-nested template, the parse failure was due to this, it is safe to assume this refers to a file
+                        //for backwards compatibility and keep going
+                        templateContext = new TemplateQueryParser.TemplateContext(ScriptService.ScriptType.FILE, templateContext.template(), templateContext.params());
+                    }
+                    if (parser != null) {
+                        TemplateQueryParser.TemplateContext innerContext = TemplateQueryParser.parse(parser, "params");
+                        if (hasLength(innerContext.template()) && !innerContext.scriptType().equals(ScriptService.ScriptType.INLINE)) {
+                            //An inner template referring to a filename or id
+                            templateContext = new TemplateQueryParser.TemplateContext(innerContext.scriptType(), innerContext.template(), templateContext.params());
+                        }
                     }
                 }
             } catch (IOException e) {
@@ -750,7 +760,7 @@ public class SearchService extends AbstractLifecycleComponent<SearchService> {
             final MapperService mapperService = indexShard.mapperService();
             final ObjectSet<String> warmUp = new ObjectOpenHashSet<>();
             for (DocumentMapper docMapper : mapperService.docMappers(false)) {
-                for (FieldMapper<?> fieldMapper : docMapper.mappers().mappers()) {
+                for (FieldMapper<?> fieldMapper : docMapper.mappers()) {
                     final String indexName = fieldMapper.names().indexName();
                     if (fieldMapper.fieldType().indexed() && !fieldMapper.fieldType().omitNorms() && fieldMapper.normsLoading(defaultLoading) == Loading.EAGER) {
                         warmUp.add(indexName);
@@ -806,7 +816,7 @@ public class SearchService extends AbstractLifecycleComponent<SearchService> {
             final MapperService mapperService = indexShard.mapperService();
             final Map<String, FieldMapper<?>> warmUp = new HashMap<>();
             for (DocumentMapper docMapper : mapperService.docMappers(false)) {
-                for (FieldMapper<?> fieldMapper : docMapper.mappers().mappers()) {
+                for (FieldMapper<?> fieldMapper : docMapper.mappers()) {
                     final FieldDataType fieldDataType = fieldMapper.fieldDataType();
                     if (fieldDataType == null) {
                         continue;
@@ -860,7 +870,7 @@ public class SearchService extends AbstractLifecycleComponent<SearchService> {
             final MapperService mapperService = indexShard.mapperService();
             final Map<String, FieldMapper<?>> warmUpGlobalOrdinals = new HashMap<>();
             for (DocumentMapper docMapper : mapperService.docMappers(false)) {
-                for (FieldMapper<?> fieldMapper : docMapper.mappers().mappers()) {
+                for (FieldMapper<?> fieldMapper : docMapper.mappers()) {
                     final FieldDataType fieldDataType = fieldMapper.fieldDataType();
                     if (fieldDataType == null) {
                         continue;
@@ -933,11 +943,8 @@ public class SearchService extends AbstractLifecycleComponent<SearchService> {
                         SearchContext context = null;
                         try {
                             long now = System.nanoTime();
-                            ShardSearchRequest request = new ShardSearchRequest(indexShard.shardId().index().name(), indexShard.shardId().id(), indexMetaData.numberOfShards(),
-                                    SearchType.QUERY_THEN_FETCH)
-                                    .source(entry.source())
-                                    .types(entry.types())
-                                    .queryCache(entry.queryCache());
+                            ShardSearchRequest request = new ShardSearchLocalRequest(indexShard.shardId(), indexMetaData.numberOfShards(),
+                                    SearchType.QUERY_THEN_FETCH, entry.source(), entry.types(), entry.queryCache());
                             context = createContext(request, warmerContext.searcher());
                             // if we use sort, we need to do query to sort on it and load relevant field data
                             // if not, we might as well use COUNT (and cache if needed)

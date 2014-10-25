@@ -24,7 +24,6 @@ import org.elasticsearch.action.admin.indices.recovery.RecoveryResponse;
 import org.elasticsearch.action.admin.indices.recovery.ShardRecoveryResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.routing.allocation.allocator.BalancedShardsAllocator;
 import org.elasticsearch.cluster.routing.allocation.decider.EnableAllocationDecider;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.settings.Settings;
@@ -37,6 +36,7 @@ import org.elasticsearch.test.ElasticsearchIntegrationTest.ClusterScope;
 import org.elasticsearch.test.InternalTestCluster.RestartCallback;
 import org.elasticsearch.test.junit.annotations.TestLogging;
 import org.elasticsearch.test.store.MockDirectoryHelper;
+import org.elasticsearch.test.store.MockFSDirectoryService;
 import org.junit.Test;
 
 import static org.elasticsearch.cluster.metadata.IndexMetaData.SETTING_NUMBER_OF_REPLICAS;
@@ -348,8 +348,13 @@ public class SimpleRecoveryLocalGatewayTests extends ElasticsearchIntegrationTes
     public void testReusePeerRecovery() throws Exception {
         ImmutableSettings.Builder settings = settingsBuilder()
                 .put("action.admin.cluster.node.shutdown.delay", "10ms")
+                .put(MockFSDirectoryService.CHECK_INDEX_ON_CLOSE, false)
                 .put("gateway.recover_after_nodes", 4)
-                .put(MockDirectoryHelper.CRASH_INDEX, false);
+                .put(MockDirectoryHelper.CRASH_INDEX, false)
+                // prevent any rebalance actions during the peer recovery
+                // if we run into a relocation the reuse count will be 0 and this fails the test. We are testing here if
+                // we reuse the files on disk after full restarts for replicas.
+                .put(EnableAllocationDecider.INDEX_ROUTING_REBALANCE_ENABLE, EnableAllocationDecider.Rebalance.NONE);
 
         internalCluster().startNodesAsync(4, settings.build()).get();
 
@@ -366,11 +371,7 @@ public class SimpleRecoveryLocalGatewayTests extends ElasticsearchIntegrationTes
         ensureGreen();
 
         logger.info("--> shutting down the nodes");
-        // prevent any rebalance actions during the peer recovery
-        // if we run into a relocation the reuse count will be 0 and this fails the test. We are testing here if
-        // we reuse the files on disk after full restarts for replicas.
-        client().admin().cluster().prepareUpdateSettings()
-                .setPersistentSettings(settingsBuilder().put(BalancedShardsAllocator.SETTING_THRESHOLD, 100.0f)).get();
+
         // Disable allocations while we are closing nodes
         client().admin().cluster().prepareUpdateSettings()
                 .setTransientSettings(settingsBuilder()

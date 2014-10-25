@@ -31,8 +31,10 @@ import org.apache.lucene.util.LuceneTestCase.SuppressCodecs;
 import org.elasticsearch.common.lucene.Lucene;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
+import org.elasticsearch.test.CurrentTestFailedMarker;
 import org.elasticsearch.test.ElasticsearchIntegrationTest;
 import org.elasticsearch.test.ElasticsearchTestCase;
+import org.elasticsearch.test.PrintAllThreadStacksOnFailure;
 import org.elasticsearch.test.junit.listeners.ReproduceInfoPrinter;
 import org.junit.After;
 import org.junit.Before;
@@ -56,7 +58,9 @@ import java.util.logging.Logger;
 })
 @Listeners({
         ReproduceInfoPrinter.class,
-        FailureMarker.class
+        FailureMarker.class,
+        CurrentTestFailedMarker.class,
+        PrintAllThreadStacksOnFailure.class
 })
 @RunWith(value = com.carrotsearch.randomizedtesting.RandomizedRunner.class)
 @SuppressCodecs(value = "Lucene3x")
@@ -98,6 +102,21 @@ public abstract class AbstractRandomizedTest extends RandomizedTest {
      * via the commandline -D{@value #TESTS_BACKWARDS_COMPATIBILITY_PATH}
      */
     public static final String TESTS_BACKWARDS_COMPATIBILITY_PATH = "tests.bwc.path";
+
+    /**
+     * Annotation for REST tests
+     */
+    @Inherited
+    @Retention(RetentionPolicy.RUNTIME)
+    @Target(ElementType.TYPE)
+    @TestGroup(enabled = true, sysProperty = TESTS_REST)
+    public @interface Rest {
+    }
+
+    /**
+     * Property that allows to control whether the REST tests are run (default) or not
+     */
+    public static final String TESTS_REST = "tests.rest";
 
     /**
      * Annotation for integration tests
@@ -354,12 +373,16 @@ public abstract class AbstractRandomizedTest extends RandomizedTest {
     // Suite and test case setup/ cleanup.
     // -----------------------------------------------------------------
 
+    /** MockFSDirectoryService sets this: */
+    public static boolean checkIndexFailed;
+
     /**
      * For subclasses to override. Overrides must call {@code super.setUp()}.
      */
     @Before
     public void setUp() throws Exception {
         parentChainCallRule.setupCalled = true;
+        checkIndexFailed = false;
     }
 
     /**
@@ -368,6 +391,7 @@ public abstract class AbstractRandomizedTest extends RandomizedTest {
     @After
     public void tearDown() throws Exception {
         parentChainCallRule.teardownCalled = true;
+        assertFalse("at least one shard failed CheckIndex", checkIndexFailed);
     }
 
 

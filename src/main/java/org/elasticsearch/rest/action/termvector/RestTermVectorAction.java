@@ -77,12 +77,14 @@ public class RestTermVectorAction extends BaseRestHandler {
         termVectorRequest.positions(request.paramAsBoolean("positions", termVectorRequest.positions()));
         termVectorRequest.payloads(request.paramAsBoolean("payloads", termVectorRequest.payloads()));
         termVectorRequest.routing(request.param("routing"));
+        termVectorRequest.realtime(request.paramAsBoolean("realtime", null));
         termVectorRequest.parent(request.param("parent"));
         termVectorRequest.preference(request.param("preference"));
         termVectorRequest.termStatistics(request.paramAsBoolean("termStatistics", termVectorRequest.termStatistics()));
         termVectorRequest.termStatistics(request.paramAsBoolean("term_statistics", termVectorRequest.termStatistics()));
         termVectorRequest.fieldStatistics(request.paramAsBoolean("fieldStatistics", termVectorRequest.fieldStatistics()));
         termVectorRequest.fieldStatistics(request.paramAsBoolean("field_statistics", termVectorRequest.fieldStatistics()));
+        termVectorRequest.dfs(request.paramAsBoolean("dfs", termVectorRequest.dfs()));
     }
 
     static public void addFieldStringsFromParameter(TermVectorRequest termVectorRequest, String fields) {

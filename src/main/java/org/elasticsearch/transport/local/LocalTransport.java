@@ -117,13 +117,7 @@ public class LocalTransport extends AbstractLifecycleComponent<Transport> implem
 
     @Override
     protected void doClose() throws ElasticsearchException {
-        workers.shutdown();
-        try {
-            workers.awaitTermination(10, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        workers.shutdownNow();
+        ThreadPool.terminate(workers, 10, TimeUnit.SECONDS);
     }
 
     @Override
@@ -268,26 +262,27 @@ public class LocalTransport extends AbstractLifecycleComponent<Transport> implem
             } else {
                 threadPool.executor(handler.executor()).execute(new AbstractRunnable() {
                     @Override
-                    public void run() {
-                        try {
-                            //noinspection unchecked
-                            handler.messageReceived(request, transportChannel);
-                        } catch (Throwable e) {
-                            if (lifecycleState() == Lifecycle.State.STARTED) {
-                                // we can only send a response transport is started....
-                                try {
-                                    transportChannel.sendResponse(e);
-                                } catch (Throwable e1) {
-                                    logger.warn("Failed to send error message back to client for action [" + action + "]", e1);
-                                    logger.warn("Actual Exception", e);
-                                }
-                            }
-                        }
+                    protected void doRun() throws Exception {
+                        //noinspection unchecked
+                        handler.messageReceived(request, transportChannel);
                     }
 
                     @Override
                     public boolean isForceExecution() {
                         return handler.isForceExecution();
+                    }
+
+                    @Override
+                    public void onFailure(Throwable e) {
+                        if (lifecycleState() == Lifecycle.State.STARTED) {
+                            // we can only send a response transport is started....
+                            try {
+                                transportChannel.sendResponse(e);
+                            } catch (Throwable e1) {
+                                logger.warn("Failed to send error message back to client for action [" + action + "]", e1);
+                                logger.warn("Actual Exception", e);
+                            }
+                        }
                     }
                 });
             }

@@ -90,16 +90,16 @@ public class NettyTransportTests extends ElasticsearchIntegrationTest {
         }
 
         @Override
-        public ChannelPipelineFactory configureServerChannelPipelineFactory() {
-            return new ErrorPipelineFactory(this);
+        public ChannelPipelineFactory configureServerChannelPipelineFactory(String name, Settings groupSettings) {
+            return new ErrorPipelineFactory(this, name, groupSettings);
         }
 
-        private static class ErrorPipelineFactory extends ServerChannelPipeFactory {
+        private static class ErrorPipelineFactory extends ServerChannelPipelineFactory {
 
             private final ESLogger logger;
 
-            public ErrorPipelineFactory(ExceptionThrowingNettyTransport exceptionThrowingNettyTransport) {
-                super(exceptionThrowingNettyTransport);
+            public ErrorPipelineFactory(ExceptionThrowingNettyTransport exceptionThrowingNettyTransport, String name, Settings groupSettings) {
+                super(exceptionThrowingNettyTransport, name, groupSettings);
                 this.logger = exceptionThrowingNettyTransport.logger;
             }
 
@@ -155,26 +155,26 @@ public class NettyTransportTests extends ElasticsearchIntegrationTest {
 
                         @SuppressWarnings({"unchecked"})
                         @Override
-                        public void run() {
-                            try {
-                                handler.messageReceived(request, transportChannel);
-                            } catch (Throwable e) {
-                                if (transport.lifecycleState() == Lifecycle.State.STARTED) {
-                                    // we can only send a response transport is started....
-                                    try {
-                                        transportChannel.sendResponse(e);
-                                    } catch (Throwable e1) {
-                                        logger.warn("Failed to send error message back to client for action [" + action + "]", e1);
-                                        logger.warn("Actual Exception", e);
-                                    }
-                                }
-                            }
+                        protected void doRun() throws Exception {
+                            handler.messageReceived(request, transportChannel);
                         }
 
                         @Override
                         public boolean isForceExecution() {
                             return handler.isForceExecution();
                         }
+
+                        @Override
+                        public void onFailure(Throwable e) {
+                            if (transport.lifecycleState() == Lifecycle.State.STARTED) {
+                                // we can only send a response transport is started....
+                                try {
+                                    transportChannel.sendResponse(e);
+                                } catch (Throwable e1) {
+                                    logger.warn("Failed to send error message back to client for action [" + action + "]", e1);
+                                    logger.warn("Actual Exception", e);
+                                }
+                            }                        }
                     }
                 });
                 return pipeline;

@@ -37,6 +37,16 @@ import static org.hamcrest.Matchers.sameInstance;
 public class VersionTests extends ElasticsearchTestCase {
 
     @Test
+    public void testMavenVersion() {
+        // maven sets this property to ensure that the latest version
+        // we use here is the version that is actually set to the project.version
+        // in maven
+        String property = System.getProperty("tests.version", null);
+        assumeNotNull(property);
+        assertEquals(property, Version.CURRENT.toString());
+    }
+
+    @Test
     public void testVersions() throws Exception {
         assertThat(V_0_20_0.before(V_0_90_0), is(true));
         assertThat(V_0_20_0.before(V_0_20_0), is(false));
@@ -101,9 +111,12 @@ public class VersionTests extends ElasticsearchTestCase {
         Version.fromString("WRONG.VERSION");
     }
 
+    @Test(expected = ElasticsearchIllegalStateException.class)
+    public void testVersionNoPresentInSettings() {
+        Version.indexCreated(ImmutableSettings.builder().build());
+    }
+
     public void testVersion() {
-        // test scenario
-        assertEquals(Version.CURRENT, Version.indexCreated(ImmutableSettings.builder().build()));
         // an actual index has a IndexMetaData.SETTING_UUID
         final Version version = randomFrom(Version.V_0_18_0, Version.V_0_90_13, Version.V_1_3_0);
         assertEquals(version, Version.indexCreated(ImmutableSettings.builder().put(IndexMetaData.SETTING_UUID, "foo").put(IndexMetaData.SETTING_VERSION_CREATED, version).build()));

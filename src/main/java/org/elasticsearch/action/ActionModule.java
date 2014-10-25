@@ -39,6 +39,8 @@ import org.elasticsearch.action.admin.cluster.repositories.get.GetRepositoriesAc
 import org.elasticsearch.action.admin.cluster.repositories.get.TransportGetRepositoriesAction;
 import org.elasticsearch.action.admin.cluster.repositories.put.PutRepositoryAction;
 import org.elasticsearch.action.admin.cluster.repositories.put.TransportPutRepositoryAction;
+import org.elasticsearch.action.admin.cluster.repositories.verify.TransportVerifyRepositoryAction;
+import org.elasticsearch.action.admin.cluster.repositories.verify.VerifyRepositoryAction;
 import org.elasticsearch.action.admin.cluster.reroute.ClusterRerouteAction;
 import org.elasticsearch.action.admin.cluster.reroute.TransportClusterRerouteAction;
 import org.elasticsearch.action.admin.cluster.settings.ClusterUpdateSettingsAction;
@@ -158,6 +160,7 @@ import org.elasticsearch.action.support.ActionFilter;
 import org.elasticsearch.action.support.ActionFilters;
 import org.elasticsearch.action.support.TransportAction;
 import org.elasticsearch.action.termvector.*;
+import org.elasticsearch.action.termvector.dfs.TransportDfsOnlyAction;
 import org.elasticsearch.action.update.TransportUpdateAction;
 import org.elasticsearch.action.update.UpdateAction;
 import org.elasticsearch.common.inject.AbstractModule;
@@ -238,6 +241,7 @@ public class ActionModule extends AbstractModule {
         registerAction(PutRepositoryAction.INSTANCE, TransportPutRepositoryAction.class);
         registerAction(GetRepositoriesAction.INSTANCE, TransportGetRepositoriesAction.class);
         registerAction(DeleteRepositoryAction.INSTANCE, TransportDeleteRepositoryAction.class);
+        registerAction(VerifyRepositoryAction.INSTANCE, TransportVerifyRepositoryAction.class);
         registerAction(GetSnapshotsAction.INSTANCE, TransportGetSnapshotsAction.class);
         registerAction(DeleteSnapshotAction.INSTANCE, TransportDeleteSnapshotAction.class);
         registerAction(CreateSnapshotAction.INSTANCE, TransportCreateSnapshotAction.class);
@@ -277,7 +281,8 @@ public class ActionModule extends AbstractModule {
 
         registerAction(IndexAction.INSTANCE, TransportIndexAction.class);
         registerAction(GetAction.INSTANCE, TransportGetAction.class);
-        registerAction(TermVectorAction.INSTANCE, TransportSingleShardTermVectorAction.class);
+        registerAction(TermVectorAction.INSTANCE, TransportSingleShardTermVectorAction.class,
+                TransportDfsOnlyAction.class);
         registerAction(MultiTermVectorsAction.INSTANCE, TransportMultiTermVectorsAction.class,
                 TransportSingleShardMultiTermsVectorAction.class);
         registerAction(DeleteAction.INSTANCE, TransportDeleteAction.class,

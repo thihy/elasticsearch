@@ -25,6 +25,7 @@ import org.apache.lucene.search.Filter;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.Sort;
+import org.apache.lucene.util.Counter;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.action.search.SearchType;
 import org.elasticsearch.cache.recycler.PageCacheRecycler;
@@ -58,11 +59,11 @@ import org.elasticsearch.search.aggregations.SearchContextAggregations;
 import org.elasticsearch.search.dfs.DfsSearchResult;
 import org.elasticsearch.search.fetch.FetchSearchResult;
 import org.elasticsearch.search.fetch.fielddata.FieldDataFieldsContext;
-import org.elasticsearch.search.fetch.partial.PartialFieldsContext;
 import org.elasticsearch.search.fetch.script.ScriptFieldsContext;
 import org.elasticsearch.search.fetch.source.FetchSourceContext;
 import org.elasticsearch.search.highlight.SearchContextHighlight;
 import org.elasticsearch.search.lookup.SearchLookup;
+import org.elasticsearch.search.query.QueryPhaseExecutionException;
 import org.elasticsearch.search.query.QuerySearchResult;
 import org.elasticsearch.search.rescore.RescoreSearchContext;
 import org.elasticsearch.search.scan.ScanContext;
@@ -82,6 +83,7 @@ public class DefaultSearchContext extends SearchContext {
     private final ShardSearchRequest request;
 
     private final SearchShardTarget shardTarget;
+    private final Counter timeEstimateCounter;
 
     private SearchType searchType;
 
@@ -128,7 +130,6 @@ public class DefaultSearchContext extends SearchContext {
     private List<String> fieldNames;
     private FieldDataFieldsContext fieldDataFields;
     private ScriptFieldsContext scriptFields;
-    private PartialFieldsContext partialFields;
     private FetchSourceContext fetchSourceContext;
 
     private int from = -1;
@@ -178,7 +179,7 @@ public class DefaultSearchContext extends SearchContext {
     public DefaultSearchContext(long id, ShardSearchRequest request, SearchShardTarget shardTarget,
                          Engine.Searcher engineSearcher, IndexService indexService, IndexShard indexShard,
                          ScriptService scriptService, PageCacheRecycler pageCacheRecycler,
-                         BigArrays bigArrays) {
+                         BigArrays bigArrays, Counter timeEstimateCounter) {
         this.id = id;
         this.request = request;
         this.searchType = request.searchType();
@@ -198,6 +199,7 @@ public class DefaultSearchContext extends SearchContext {
 
         // initialize the filtering alias based on the provided filters
         aliasFilter = indexService.aliasesService().aliasFilter(request.filteringAliases());
+        this.timeEstimateCounter = timeEstimateCounter;
     }
 
     @Override
@@ -213,6 +215,15 @@ public class DefaultSearchContext extends SearchContext {
      * Should be called before executing the main query and after all other parameters have been set.
      */
     public void preProcess() {
+        if (!(from() == -1 && size() == -1)) {
+            // from and size have been set.
+            int numHits = from() + size();
+            if (numHits < 0) {
+                String msg = "Result window is too large, from + size must be less than or equal to: [" + Integer.MAX_VALUE + "] but was [" + (((long) from()) + ((long) size())) + "]";
+                throw new QueryPhaseExecutionException(this, msg);
+            }
+        }
+
         if (query() == null) {
             parsedQuery(ParsedQuery.parsedMatchAllQuery());
         }
@@ -364,17 +375,6 @@ public class DefaultSearchContext extends SearchContext {
             scriptFields = new ScriptFieldsContext();
         }
         return this.scriptFields;
-    }
-
-    public boolean hasPartialFields() {
-        return partialFields != null;
-    }
-
-    public PartialFieldsContext partialFields() {
-        if (partialFields == null) {
-            partialFields = new PartialFieldsContext();
-        }
-        return this.partialFields;
     }
 
     /**
@@ -694,5 +694,10 @@ public class DefaultSearchContext extends SearchContext {
     public DefaultSearchContext useSlowScroll(boolean useSlowScroll) {
         this.useSlowScroll = useSlowScroll;
         return this;
+    }
+
+    @Override
+    public Counter timeEstimateCounter() {
+        return timeEstimateCounter;
     }
 }

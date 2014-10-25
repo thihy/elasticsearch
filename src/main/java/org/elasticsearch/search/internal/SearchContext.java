@@ -25,6 +25,7 @@ import org.apache.lucene.search.Filter;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.ScoreDoc;
 import org.apache.lucene.search.Sort;
+import org.apache.lucene.util.Counter;
 import org.elasticsearch.action.search.SearchType;
 import org.elasticsearch.cache.recycler.PageCacheRecycler;
 import org.elasticsearch.common.Nullable;
@@ -51,7 +52,6 @@ import org.elasticsearch.search.aggregations.SearchContextAggregations;
 import org.elasticsearch.search.dfs.DfsSearchResult;
 import org.elasticsearch.search.fetch.FetchSearchResult;
 import org.elasticsearch.search.fetch.fielddata.FieldDataFieldsContext;
-import org.elasticsearch.search.fetch.partial.PartialFieldsContext;
 import org.elasticsearch.search.fetch.script.ScriptFieldsContext;
 import org.elasticsearch.search.fetch.source.FetchSourceContext;
 import org.elasticsearch.search.highlight.SearchContextHighlight;
@@ -174,10 +174,6 @@ public abstract class SearchContext implements Releasable {
     public abstract boolean hasScriptFields();
 
     public abstract ScriptFieldsContext scriptFields();
-
-    public abstract boolean hasPartialFields();
-
-    public abstract PartialFieldsContext partialFields();
 
     /**
      * A shortcut function to see whether there is a fetchSourceContext and it says the source is requested.
@@ -353,6 +349,8 @@ public abstract class SearchContext implements Releasable {
     public abstract boolean useSlowScroll();
 
     public abstract SearchContext useSlowScroll(boolean useSlowScroll);
+
+    public abstract Counter timeEstimateCounter();
 
     /**
      * The life time of an object that is used during search execution.

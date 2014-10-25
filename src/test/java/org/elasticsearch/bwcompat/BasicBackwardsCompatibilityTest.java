@@ -36,7 +36,9 @@ import org.elasticsearch.action.explain.ExplainResponse;
 import org.elasticsearch.action.get.*;
 import org.elasticsearch.action.index.IndexRequestBuilder;
 import org.elasticsearch.action.index.IndexResponse;
+import org.elasticsearch.action.search.SearchRequestBuilder;
 import org.elasticsearch.action.search.SearchResponse;
+import org.elasticsearch.action.search.SearchType;
 import org.elasticsearch.action.termvector.TermVectorResponse;
 import org.elasticsearch.action.update.UpdateRequestBuilder;
 import org.elasticsearch.action.update.UpdateResponse;
@@ -148,10 +150,15 @@ public class BasicBackwardsCompatibilityTest extends ElasticsearchBackwardsCompa
 
     @Test
     public void testRecoverFromPreviousVersion() throws ExecutionException, InterruptedException {
+
+        if (backwardsCluster().numNewDataNodes() == 0) {
+            backwardsCluster().startNewNode();
+        }
         assertAcked(prepareCreate("test").setSettings(ImmutableSettings.builder().put("index.routing.allocation.exclude._name", backwardsCluster().newNodePattern()).put(indexSettings())));
         ensureYellow();
         assertAllShardsOnNodes("test", backwardsCluster().backwardsNodePattern());
         int numDocs = randomIntBetween(100, 150);
+        logger.info(" --> indexing [{}] docs", numDocs);
         IndexRequestBuilder[] docs = new IndexRequestBuilder[numDocs];
         for (int i = 0; i < numDocs; i++) {
             docs[i] = client().prepareIndex("test", "type1", randomRealisticUnicodeOfLength(10) + String.valueOf(i)).setSource("field1", English.intToEnglish(i));
@@ -159,8 +166,27 @@ public class BasicBackwardsCompatibilityTest extends ElasticsearchBackwardsCompa
         indexRandom(true, docs);
         CountResponse countResponse = client().prepareCount().get();
         assertHitCount(countResponse, numDocs);
-        backwardsCluster().allowOnlyNewNodes("test");
-        ensureYellow("test");// move all shards to the new node
+
+        if (randomBoolean()) {
+            logger.info(" --> moving index to new nodes");
+            backwardsCluster().allowOnlyNewNodes("test");
+        } else {
+            logger.info(" --> allow index to on all nodes");
+            backwardsCluster().allowOnAllNodes("test");
+        }
+
+        logger.info(" --> indexing [{}] more docs", numDocs);
+        // sometimes index while relocating
+        if (randomBoolean()) {
+            for (int i = 0; i < numDocs; i++) {
+                docs[i] = client().prepareIndex("test", "type1", randomRealisticUnicodeOfLength(10) + String.valueOf(numDocs + i)).setSource("field1", English.intToEnglish(numDocs + i));
+            }
+            indexRandom(true, docs);
+            numDocs *= 2;
+        }
+
+        logger.info(" --> waiting for relocation to complete", numDocs);
+        ensureYellow("test");// move all shards to the new node (it waits on relocation)
         final int numIters = randomIntBetween(10, 20);
         for (int i = 0; i < numIters; i++) {
             countResponse = client().prepareCount().get();
@@ -218,20 +244,6 @@ public class BasicBackwardsCompatibilityTest extends ElasticsearchBackwardsCompa
                     assertThat(previous.doubleValue(), lessThanOrEqualTo(((Number) hit.getSource().get(field)).doubleValue()));
                 }
                 previous = (Number) hit.getSource().get(field);
-            }
-        }
-    }
-
-    public void assertAllShardsOnNodes(String index, String pattern) {
-        ClusterState clusterState = client().admin().cluster().prepareState().execute().actionGet().getState();
-        for (IndexRoutingTable indexRoutingTable : clusterState.routingTable()) {
-            for (IndexShardRoutingTable indexShardRoutingTable : indexRoutingTable) {
-                for (ShardRouting shardRouting : indexShardRoutingTable) {
-                    if (shardRouting.currentNodeId() != null &&  index.equals(shardRouting.getIndex())) {
-                        String name = clusterState.nodes().get(shardRouting.currentNodeId()).name();
-                        assertThat("Allocated on new node: " + name, Regex.simpleMatch(pattern, name), is(true));
-                    }
-                }
             }
         }
     }
@@ -338,6 +350,7 @@ public class BasicBackwardsCompatibilityTest extends ElasticsearchBackwardsCompa
             assertThat(settings.getAsVersion(IndexMetaData.SETTING_VERSION_CREATED, null), equalTo(version));
         }
     }
+
 
     @Test
     public void testUnsupportedFeatures() throws IOException {
@@ -677,6 +690,49 @@ public class BasicBackwardsCompatibilityTest extends ElasticsearchBackwardsCompa
             assertThat(multiGetItemResponse.getResponse().getId(), equalTo(multiGetRequestBuilder.request().getItems().get(i).id()));
         }
 
+    }
+
+    @Test
+    public void testScroll() throws ExecutionException, InterruptedException {
+        createIndex("test");
+        ensureYellow("test");
+
+        int numDocs = iterations(10, 100);
+        IndexRequestBuilder[] indexRequestBuilders = new IndexRequestBuilder[numDocs];
+        for (int i = 0; i < numDocs; i++) {
+            indexRequestBuilders[i] = client().prepareIndex("test", "type", Integer.toString(i)).setSource("field", "value" + Integer.toString(i));
+        }
+        indexRandom(true, indexRequestBuilders);
+
+        int size = randomIntBetween(1, 10);
+        SearchRequestBuilder searchRequestBuilder = client().prepareSearch("test").setScroll("1m").setSize(size);
+        boolean scan = randomBoolean();
+        if (scan) {
+            searchRequestBuilder.setSearchType(SearchType.SCAN);
+        }
+
+        SearchResponse searchResponse = searchRequestBuilder.get();
+        assertThat(searchResponse.getScrollId(), notNullValue());
+        assertHitCount(searchResponse, numDocs);
+        int hits = 0;
+        if (scan) {
+            assertThat(searchResponse.getHits().getHits().length, equalTo(0));
+        } else {
+            assertThat(searchResponse.getHits().getHits().length, greaterThan(0));
+            hits += searchResponse.getHits().getHits().length;
+        }
+
+        try {
+            do {
+                searchResponse = client().prepareSearchScroll(searchResponse.getScrollId()).setScroll("1m").get();
+                assertThat(searchResponse.getScrollId(), notNullValue());
+                assertHitCount(searchResponse, numDocs);
+                hits += searchResponse.getHits().getHits().length;
+            } while (searchResponse.getHits().getHits().length > 0);
+            assertThat(hits, equalTo(numDocs));
+        } finally {
+            clearScroll(searchResponse.getScrollId());
+        }
     }
 
     private static String indexOrAlias() {

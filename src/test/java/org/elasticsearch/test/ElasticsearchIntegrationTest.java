@@ -55,13 +55,19 @@ import org.elasticsearch.client.AdminClient;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.client.Requests;
 import org.elasticsearch.cluster.ClusterService;
+import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.metadata.MappingMetaData;
 import org.elasticsearch.cluster.metadata.MetaData;
+import org.elasticsearch.cluster.routing.IndexRoutingTable;
+import org.elasticsearch.cluster.routing.IndexShardRoutingTable;
+import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.cluster.routing.allocation.decider.DiskThresholdDecider;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.Priority;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.collect.ImmutableOpenMap;
 import org.elasticsearch.common.collect.Tuple;
+import org.elasticsearch.common.regex.Regex;
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.InetSocketTransportAddress;
@@ -90,17 +96,19 @@ import org.elasticsearch.index.translog.TranslogService;
 import org.elasticsearch.index.translog.fs.FsTranslog;
 import org.elasticsearch.index.translog.fs.FsTranslogFile;
 import org.elasticsearch.indices.IndicesService;
+import org.elasticsearch.indices.cache.filter.IndicesFilterCache;
 import org.elasticsearch.indices.cache.query.IndicesQueryCache;
+import org.elasticsearch.indices.fielddata.cache.IndicesFieldDataCache;
 import org.elasticsearch.indices.recovery.RecoverySettings;
 import org.elasticsearch.indices.store.IndicesStore;
 import org.elasticsearch.node.internal.InternalNode;
-import org.elasticsearch.rest.RestController;
 import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.script.ScriptService;
 import org.elasticsearch.search.SearchService;
 import org.elasticsearch.test.client.RandomizingClient;
 import org.elasticsearch.test.disruption.ServiceDisruptionScheme;
 import org.hamcrest.Matchers;
+import org.joda.time.DateTimeZone;
 import org.junit.*;
 
 import java.io.IOException;
@@ -485,6 +493,12 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
         if (random.nextBoolean()) {
             builder.put(IndicesQueryCache.INDEX_CACHE_QUERY_ENABLED, random.nextBoolean());
         }
+
+        if (random.nextBoolean()) {
+            builder.put(IndicesQueryCache.INDICES_CACHE_QUERY_CONCURRENCY_LEVEL, randomIntBetween(1, 32));
+            builder.put(IndicesFieldDataCache.FIELDDATA_CACHE_CONCURRENCY_LEVEL, randomIntBetween(1, 32));
+            builder.put(IndicesFilterCache.INDICES_CACHE_FILTER_CONCURRENCY_LEVEL, randomIntBetween(1, 32));
+        }
         
         return builder;
     }
@@ -587,16 +601,18 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
             clearDisruptionScheme();
             final Scope currentClusterScope = getCurrentClusterScope();
             try {
-                if (currentClusterScope != Scope.TEST) {
-                    MetaData metaData = client().admin().cluster().prepareState().execute().actionGet().getState().getMetaData();
-                    assertThat("test leaves persistent cluster metadata behind: " + metaData.persistentSettings().getAsMap(), metaData
+                if (cluster() != null) {
+                    if (currentClusterScope != Scope.TEST) {
+                        MetaData metaData = client().admin().cluster().prepareState().execute().actionGet().getState().getMetaData();
+                        assertThat("test leaves persistent cluster metadata behind: " + metaData.persistentSettings().getAsMap(), metaData
                             .persistentSettings().getAsMap().size(), equalTo(0));
-                    assertThat("test leaves transient cluster metadata behind: " + metaData.transientSettings().getAsMap(), metaData
+                        assertThat("test leaves transient cluster metadata behind: " + metaData.transientSettings().getAsMap(), metaData
                             .transientSettings().getAsMap().size(), equalTo(0));
+                    }
+                    ensureClusterSizeConsistency();
+                    cluster().wipe(); // wipe after to make sure we fail in the test that didn't ack the delete
+                    cluster().assertAfterTest();
                 }
-                ensureClusterSizeConsistency();
-                cluster().wipe(); // wipe after to make sure we fail in the test that didn't ack the delete
-                cluster().assertAfterTest();
             } finally {
                 if (currentClusterScope == Scope.TEST) {
                     clearClusters(); // it is ok to leave persistent / transient cluster state behind if scope is TEST
@@ -604,13 +620,9 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
             }
             logger.info("[{}#{}]: cleaned up after test", getTestClass().getSimpleName(), getTestName());
             success = true;
-        } catch (OutOfMemoryError e) {
-            if (e.getMessage().contains("unable to create new native thread")) {
-                ElasticsearchTestCase.printStackDump(logger);
-            }
-            throw e;
         } finally {
-            if (!success || suiteFailureMarker.hadFailures()) {
+            // TODO: it looks like CurrentTestFailedMarker is never set at this point, so testFailed() will always be false?
+            if (!success || CurrentTestFailedMarker.testFailed()) {
                 // if we failed that means that something broke horribly so we should
                 // clear all clusters and if the current cluster is the global we shut that one
                 // down as well to prevent subsequent tests from failing due to the same problem.
@@ -854,7 +866,7 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
                     DocumentMapper documentMapper = indexService.mapperService().documentMapper(type);
                     assertThat("document mapper doesn't exists on " + node, documentMapper, notNullValue());
                     for (String fieldName : fieldNames) {
-                        Set<String> matches = documentMapper.mappers().simpleMatchToFullName(fieldName);
+                        List<String> matches = documentMapper.mappers().simpleMatchToFullName(fieldName);
                         assertThat("field " + fieldName + " doesn't exists on " + node, matches, Matchers.not(emptyIterable()));
                     }
                 }
@@ -918,8 +930,19 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
      * are now allocated and started.
      */
     public ClusterHealthStatus  ensureGreen(String... indices) {
+        return ensureGreen(TimeValue.timeValueSeconds(30), indices);
+    }
+
+    /**
+     * Ensures the cluster has a green state via the cluster health API. This method will also wait for relocations.
+     * It is useful to ensure that all action on the cluster have finished and all shards that were currently relocating
+     * are now allocated and started.
+     *
+     * @param timeout time out value to set on {@link org.elasticsearch.action.admin.cluster.health.ClusterHealthRequest}
+     */
+    public ClusterHealthStatus ensureGreen(TimeValue timeout, String... indices) {
         ClusterHealthResponse actionGet = client().admin().cluster()
-                .health(Requests.clusterHealthRequest(indices).waitForGreenStatus().waitForEvents(Priority.LANGUID).waitForRelocatingShards(0)).actionGet();
+                .health(Requests.clusterHealthRequest(indices).timeout(timeout).waitForGreenStatus().waitForEvents(Priority.LANGUID).waitForRelocatingShards(0)).actionGet();
         if (actionGet.isTimedOut()) {
             logger.info("ensureGreen timed out, cluster state:\n{}\n{}", client().admin().cluster().prepareState().get().getState().prettyPrint(), client().admin().cluster().preparePendingClusterTasks().get().prettyPrint());
             assertThat("timed out waiting for green state", actionGet.isTimedOut(), equalTo(false));
@@ -1152,27 +1175,19 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
     /**
      * Flushes and refreshes all indices in the cluster
      */
-    protected final void flushAndRefresh() {
-        flush(true);
+    protected final void flushAndRefresh(String... indices) {
+        flush(indices);
         refresh();
     }
 
     /**
-     * Flushes all indices in the cluster
+     * Flush some or all indices in the cluster.
      */
-    protected final FlushResponse flush() {
-        return flush(true);
-    }
-
-    private FlushResponse flush(boolean ignoreNotAllowed) {
+    protected final FlushResponse flush(String... indices) {
         waitForRelocation();
-        FlushResponse actionGet = client().admin().indices().prepareFlush().setWaitIfOngoing(true).execute().actionGet();
-        if (ignoreNotAllowed) {
-            for (ShardOperationFailedException failure : actionGet.getShardFailures()) {
-                assertThat("unexpected flush failure " + failure.reason(), failure.status(), equalTo(RestStatus.SERVICE_UNAVAILABLE));
-            }
-        } else {
-            assertNoFailures(actionGet);
+        FlushResponse actionGet = client().admin().indices().prepareFlush(indices).setWaitIfOngoing(true).execute().actionGet();
+        for (ShardOperationFailedException failure : actionGet.getShardFailures()) {
+            assertThat("unexpected flush failure " + failure.reason(), failure.status(), equalTo(RestStatus.SERVICE_UNAVAILABLE));
         }
         return actionGet;
     }
@@ -1182,7 +1197,7 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
      */
     protected OptimizeResponse optimize() {
         waitForRelocation();
-        OptimizeResponse actionGet = client().admin().indices().prepareOptimize().setForce(randomBoolean()).execute().actionGet();
+        OptimizeResponse actionGet = client().admin().indices().prepareOptimize().execute().actionGet();
         assertNoFailures(actionGet);
         return actionGet;
     }
@@ -1563,7 +1578,12 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
      * In other words subclasses must ensure this method is idempotent.
      */
     protected Settings nodeSettings(int nodeOrdinal) {
-        return ImmutableSettings.EMPTY;
+        return settingsBuilder()
+                // Default the watermarks to absurdly low to prevent the tests
+                // from failing on nodes without enough disk space
+                .put(DiskThresholdDecider.CLUSTER_ROUTING_ALLOCATION_LOW_DISK_WATERMARK, "1b")
+                .put(DiskThresholdDecider.CLUSTER_ROUTING_ALLOCATION_HIGH_DISK_WATERMARK, "1b")
+                .build();
     }
 
     /**
@@ -1665,12 +1685,49 @@ public abstract class ElasticsearchIntegrationTest extends ElasticsearchTestCase
         return randomFrom(Arrays.asList("paged_bytes", "fst", "doc_values"));
     }
 
+    /**
+     * Returns a random JODA Time Zone based on Java Time Zones
+     */
+    public static DateTimeZone randomDateTimeZone() {
+        DateTimeZone timeZone;
+
+        // It sounds like some Java Time Zones are unknown by JODA. For example: Asia/Riyadh88
+        // We need to fallback in that case to a known time zone
+        try {
+            timeZone = DateTimeZone.forTimeZone(randomTimeZone());
+        } catch (IllegalArgumentException e) {
+            timeZone = DateTimeZone.forOffsetHours(randomIntBetween(-12, 12));
+        }
+
+        return timeZone;
+    }
+
     protected NumShards getNumShards(String index) {
         MetaData metaData = client().admin().cluster().prepareState().get().getState().metaData();
         assertThat(metaData.hasIndex(index), equalTo(true));
         int numShards = Integer.valueOf(metaData.index(index).settings().get(SETTING_NUMBER_OF_SHARDS));
         int numReplicas = Integer.valueOf(metaData.index(index).settings().get(SETTING_NUMBER_OF_REPLICAS));
         return new NumShards(numShards, numReplicas);
+    }
+
+    /**
+     * Asserts that all shards are allocated on nodes matching the given node pattern.
+     */
+    public Set<String> assertAllShardsOnNodes(String index, String... pattern) {
+        Set<String> nodes = new HashSet<>();
+        ClusterState clusterState = client().admin().cluster().prepareState().execute().actionGet().getState();
+        for (IndexRoutingTable indexRoutingTable : clusterState.routingTable()) {
+            for (IndexShardRoutingTable indexShardRoutingTable : indexRoutingTable) {
+                for (ShardRouting shardRouting : indexShardRoutingTable) {
+                    if (shardRouting.currentNodeId() != null &&  index.equals(shardRouting.getIndex())) {
+                        String name = clusterState.nodes().get(shardRouting.currentNodeId()).name();
+                        nodes.add(name);
+                        assertThat("Allocated on new node: " + name, Regex.simpleMatch(pattern, name), is(true));
+                    }
+                }
+            }
+        }
+        return nodes;
     }
 
     protected static class NumShards {

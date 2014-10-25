@@ -46,6 +46,7 @@ import org.elasticsearch.cluster.action.index.MappingUpdatedAction;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.routing.ShardRouting;
+import org.elasticsearch.cluster.routing.allocation.decider.DiskThresholdDecider;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.io.FileSystemUtils;
@@ -68,8 +69,8 @@ import org.elasticsearch.index.cache.filter.FilterCacheModule;
 import org.elasticsearch.index.cache.filter.none.NoneFilterCache;
 import org.elasticsearch.index.cache.filter.weighted.WeightedFilterCache;
 import org.elasticsearch.index.engine.IndexEngineModule;
-import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.indices.breaker.CircuitBreakerService;
+import org.elasticsearch.indices.breaker.HierarchyCircuitBreakerService;
 import org.elasticsearch.node.Node;
 import org.elasticsearch.node.internal.InternalNode;
 import org.elasticsearch.node.service.NodeService;
@@ -272,8 +273,12 @@ public final class InternalTestCluster extends TestCluster {
         if (Strings.hasLength(System.getProperty("es.logger.prefix"))) {
             builder.put("logger.prefix", System.getProperty("es.logger.level"));
         }
+        // Default the watermarks to absurdly low to prevent the tests
+        // from failing on nodes without enough disk space
+        builder.put(DiskThresholdDecider.CLUSTER_ROUTING_ALLOCATION_LOW_DISK_WATERMARK, "1b");
+        builder.put(DiskThresholdDecider.CLUSTER_ROUTING_ALLOCATION_HIGH_DISK_WATERMARK, "1b");
         defaultSettings = builder.build();
-        executor = EsExecutors.newCached(1, TimeUnit.MINUTES, EsExecutors.daemonThreadFactory("test_" + clusterName));
+        executor = EsExecutors.newCached(0, TimeUnit.SECONDS, EsExecutors.daemonThreadFactory("test_" + clusterName));
         this.hasFilterCache = random.nextBoolean();
     }
 
@@ -400,8 +405,10 @@ public final class InternalTestCluster extends TestCluster {
         if (random.nextBoolean()) {
             builder.put(MappingUpdatedAction.INDICES_MAPPING_ADDITIONAL_MAPPING_CHANGE_TIME, RandomInts.randomIntBetween(random, 0, 500) /*milliseconds*/);
         }
-        if (random.nextBoolean()) {
-            builder.put(MapperService.DEFAULT_FIELD_MAPPERS_COLLECTION_SWITCH, RandomInts.randomIntBetween(random, 0, 5));
+
+        if (random.nextInt(10) == 0) {
+            builder.put(HierarchyCircuitBreakerService.REQUEST_CIRCUIT_BREAKER_TYPE_SETTING, "noop");
+            builder.put(HierarchyCircuitBreakerService.FIELDDATA_CIRCUIT_BREAKER_TYPE_SETTING, "noop");
         }
 
         return builder.build();
@@ -610,7 +617,7 @@ public final class InternalTestCluster extends TestCluster {
 
     public synchronized Client startNodeClient(Settings settings) {
         ensureOpen(); // currently unused
-        Builder builder = settingsBuilder().put(settings).put("node.client", true).put("node.data", false);
+        Builder builder = settingsBuilder().put(settings).put("node.client", true);
         if (size() == 0) {
             // if we are the first node - don't wait for a state
             builder.put("discovery.initial_state_timeout", 0);
@@ -880,7 +887,7 @@ public final class InternalTestCluster extends TestCluster {
             NodeAndClient nodeAndClient = nodes.get(buildNodeName);
             if (nodeAndClient == null) {
                 changed = true;
-                Builder clientSettingsBuilder = ImmutableSettings.builder().put("node.data", false).put("node.master", false);
+                Builder clientSettingsBuilder = ImmutableSettings.builder().put("node.client", true);
                 if (enableRandomBenchNodes && usually(random)) {
                     //client nodes might also be bench nodes
                     clientSettingsBuilder.put("node.bench", true);
@@ -1400,6 +1407,11 @@ public final class InternalTestCluster extends TestCluster {
     }
 
     @Override
+    public int numDataAndMasterNodes() {
+        return dataAndMasterNodes().size();
+    }
+
+    @Override
     public int numBenchNodes() {
         return benchNodeAndClients().size();
     }
@@ -1455,10 +1467,22 @@ public final class InternalTestCluster extends TestCluster {
         return Collections2.filter(nodes.values(), new DataNodePredicate());
     }
 
+    private synchronized Collection<NodeAndClient> dataAndMasterNodes() {
+        return Collections2.filter(nodes.values(), new DataOrMasterNodePredicate());
+    }
+
     private static final class DataNodePredicate implements Predicate<NodeAndClient> {
         @Override
         public boolean apply(NodeAndClient nodeAndClient) {
-            return nodeAndClient.node.settings().getAsBoolean("node.data", true);
+            return DiscoveryNode.dataNode(nodeAndClient.node.settings());
+        }
+    }
+
+    private static final class DataOrMasterNodePredicate implements Predicate<NodeAndClient> {
+        @Override
+        public boolean apply(NodeAndClient nodeAndClient) {
+            return DiscoveryNode.dataNode(nodeAndClient.node.settings()) ||
+                    DiscoveryNode.masterNode(nodeAndClient.node.settings());
         }
     }
 
@@ -1478,7 +1502,7 @@ public final class InternalTestCluster extends TestCluster {
     private static final class ClientNodePredicate implements Predicate<NodeAndClient> {
         @Override
         public boolean apply(NodeAndClient nodeAndClient) {
-            return nodeAndClient.node.settings().getAsBoolean("node.client", false);
+            return DiscoveryNode.clientNode(nodeAndClient.node.settings());
         }
     }
 
